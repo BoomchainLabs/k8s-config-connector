@@ -35,6 +35,7 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/k8s"
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/krmtotf"
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/lease/leaser"
+	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/managementconflict"
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/resourceoverrides"
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/resourceoverrides/operations"
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/servicemapping/servicemappingloader"
@@ -104,8 +105,12 @@ func Add(mgr manager.Manager, crd *apiextensions.CustomResourceDefinition, provi
 	_, err = builder.
 		ControllerManagedBy(mgr).
 		Named(controllerName).
-		WithOptions(controller.Options{MaxConcurrentReconciles: k8s.ControllerMaxConcurrentReconciles, RateLimiter: ratelimiter.NewRateLimiter()}).
-		WatchesRawSource(&source.Channel{Source: immediateReconcileRequests}, &handler.EnqueueRequestForObject{}).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: k8s.ControllerMaxConcurrentReconciles,
+			RateLimiter:             ratelimiter.NewRateLimiter(),
+		}).
+		WatchesRawSource(
+			source.TypedChannel(immediateReconcileRequests, &handler.EnqueueRequestForObject{})).
 		For(obj, builder.OnlyMetadata, builder.WithPredicates(predicateList...)).
 		Build(r)
 	if err != nil {
@@ -495,7 +500,7 @@ func (r *Reconciler) applyChangesForBackwardsCompatibility(ctx context.Context, 
 	// Ensure the resource has a management-conflict-prevention-policy
 	// annotation. This is done to be backwards compatible with resources
 	// created before the webhook for defaulting the annotation was added.
-	if err := k8s.EnsureManagementConflictPreventionAnnotationForTFBasedResource(ctx, r.Client, resource, &rc, r.provider.ResourcesMap); err != nil {
+	if err := managementconflict.EnsureManagementConflictPreventionAnnotationForTFBasedResource(ctx, r.Client, resource, &rc, r.provider.ResourcesMap); err != nil {
 		return fmt.Errorf("error ensuring resource '%v' has a management conflict policy: %w", k8s.GetNamespacedName(resource), err)
 	}
 
@@ -509,11 +514,11 @@ func (r *Reconciler) applyChangesForBackwardsCompatibility(ctx context.Context, 
 }
 
 func (r *Reconciler) obtainResourceLeaseIfNecessary(ctx context.Context, krmResource *krmtotf.Resource, liveState *terraform.InstanceState) error {
-	conflictPolicy, err := k8s.GetManagementConflictPreventionAnnotationValue(krmResource)
+	conflictPolicy, err := managementconflict.GetManagementConflictPreventionAnnotationValue(krmResource)
 	if err != nil {
 		return err
 	}
-	if conflictPolicy != k8s.ManagementConflictPreventionPolicyResource {
+	if conflictPolicy != managementconflict.ManagementConflictPreventionPolicyResource {
 		return nil
 	}
 	ok, err := r.resourceLeaser.IsLeasable(krmResource)
@@ -521,8 +526,8 @@ func (r *Reconciler) obtainResourceLeaseIfNecessary(ctx context.Context, krmReso
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("kind '%v' does not support usage of %v of '%v'", krmResource.GroupVersionKind(),
-			k8s.ManagementConflictPreventionPolicyAnnotation, conflictPolicy)
+		return fmt.Errorf("kind '%v' does not support usage of %v='%v'", krmResource.GroupVersionKind(),
+			managementconflict.FullyQualifiedAnnotation, conflictPolicy)
 	}
 	// Use SoftObtain instead of Obtain so that obtaining the lease ONLY changes the 'labels' value on the local krmResource and does not write the results
 	// to GCP. The reason to do that is to reduce the number of writes to GCP and therefore improve performance and reduce errors.
